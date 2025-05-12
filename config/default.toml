@@ -1,0 +1,9 @@
+[api]
+url = "https://ms.suzhouparking.kingfaster.com.cn/ParkingSpaceApi/GetData"
+scraping_interval_secs = 30
+
+[influxdb]
+url = "YOUR-INFLUX-DB-URL"
+org = "YOUR-INFLUX-DB-ORG"
+bucket = "YOUR-INFLUX-DB-BUCKET"
+token = "YOUR-INFLUX-DB-TOKEN"
