@@ -73,6 +73,11 @@ fn create_data_point(area: &AreaData) -> DataPoint {
     
     DataPoint::builder("parking_spaces")
         .tag("area_code", area.area_code.to_string())
+        .tag("location", match area.area_code {
+            12 => "SIP-B25-B26".to_string(),
+            2 => "ZHONGMENG".to_string(),
+            _ => "Unknown".to_string(),
+        })
         .field("free_spaces", area.area_free_space_num)
         .timestamp(now.timestamp_nanos_opt().unwrap())
         .build()
