@@ -1,11 +1,13 @@
 use anyhow::{Context, Result};
-use chrono::Utc;
+use chrono::{DateTime, Timelike, Utc};
+use chrono_tz::Asia::Shanghai;
 use config::{Config, File};
 use futures::stream;
 use influxdb2::Client;
 use influxdb2::models::DataPoint;
 use log::{error, info};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::time;
@@ -38,7 +40,7 @@ struct ApiResponse {
     date: String,
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 struct AreaData {
     #[serde(rename = "areaCode")]
     area_code: i32,
@@ -68,6 +70,14 @@ async fn fetch_parking_data(url: &str) -> Result<ApiResponse> {
     Ok(data)
 }
 
+fn is_in_maintenance_window() -> bool {
+    let shanghai_time: DateTime<chrono_tz::Tz> = Utc::now().with_timezone(&Shanghai);
+    let hour = shanghai_time.hour();
+    let minute = shanghai_time.minute();
+    
+    (hour == 23 && minute >= 50) || (hour == 0 && minute < 20)
+}
+
 fn create_data_point(area: &AreaData) -> DataPoint {
     let now = Utc::now();
     
@@ -89,11 +99,40 @@ async fn run_scraper(config: AppConfig) -> Result<()> {
     
     let mut interval = time::interval(Duration::from_secs(config.api.scraping_interval_secs));
     
+    let mut cached_data: HashMap<i32, AreaData> = HashMap::new();
+    
     info!("Starting parking data scraper. Interval: {} seconds", config.api.scraping_interval_secs);
     
     loop {
         interval.tick().await;
         info!("Fetching parking data...");
+        
+        let using_cache = is_in_maintenance_window();
+        if using_cache {
+            info!("Currently in maintenance window (23:50-00:20 GMT+8), using cached data");
+            
+            if cached_data.is_empty() {
+                info!("No cached data available, attempting to fetch fresh data anyway");
+            } else {
+                let data_points: Vec<DataPoint> = cached_data.values()
+                    .map(|area| create_data_point(area))
+                    .collect();
+                
+                info!("Using cached data for {} areas", data_points.len());
+                
+                for area in cached_data.values() {
+                    info!("Cached - Area {}: {} free spaces", area.area_code, area.area_free_space_num);
+                }
+                
+                match client.write(&config.influxdb.bucket, stream::iter(data_points))
+                    .await {
+                        Ok(_) => info!("Successfully wrote cached data to InfluxDB"),
+                        Err(e) => error!("Failed to write cached data to InfluxDB: {}", e),
+                    }
+                
+                continue;
+        }
+    }
         
         match fetch_parking_data(&config.api.url).await {
             Ok(data) => {
@@ -105,6 +144,12 @@ async fn run_scraper(config: AppConfig) -> Result<()> {
                 if data.msparking_data.is_empty() {
                     error!("No parking data available in the response");
                     continue;
+                }
+                
+                for area in &data.msparking_data {
+                    if area.area_free_space_num > 0 {
+                        cached_data.insert(area.area_code, area.clone());
+                    }
                 }
                 
                 let data_points: Vec<DataPoint> = data.msparking_data
