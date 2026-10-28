@@ -58,10 +58,29 @@ async fn load_config() -> Result<AppConfig> {
         .context("Failed to deserialize configuration")
 }
 
-async fn fetch_parking_data(url: &str) -> Result<ApiResponse> {
-    let response = reqwest::get(url)
+// Every network call must be bounded: a single stalled TCP connection (peer silently gone,
+// NAT/route change) otherwise parks the loop forever while systemd still reports "running".
+const API_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+const API_TIMEOUT: Duration = Duration::from_secs(20);
+const INFLUX_WRITE_TIMEOUT: Duration = Duration::from_secs(20);
+
+fn build_api_client() -> Result<reqwest::Client> {
+    reqwest::Client::builder()
+        .connect_timeout(API_CONNECT_TIMEOUT)
+        .timeout(API_TIMEOUT)
+        .tcp_keepalive(Duration::from_secs(15))
+        .pool_idle_timeout(Duration::from_secs(30))
+        .build()
+        .context("Failed to build API HTTP client")
+}
+
+async fn fetch_parking_data(http: &reqwest::Client, url: &str) -> Result<ApiResponse> {
+    let response = http.get(url)
+        .send()
         .await
-        .context("Failed to send request")?;
+        .context("Failed to send request")?
+        .error_for_status()
+        .context("API returned HTTP error")?;
     
     let data = response.json::<ApiResponse>()
         .await
@@ -94,10 +113,22 @@ fn create_data_point(area: &AreaData) -> DataPoint {
         .unwrap()
 }
 
+async fn write_points(client: &Client, bucket: &str, data_points: Vec<DataPoint>) -> Result<()> {
+    // influxdb2 0.5 owns its reqwest 0.11 client with no timeout; bound the whole write here.
+    // Dropping the future on timeout drops the hung connection, so the next write dials fresh.
+    time::timeout(INFLUX_WRITE_TIMEOUT, client.write(bucket, stream::iter(data_points)))
+        .await
+        .map_err(|_| anyhow::anyhow!("timed out after {:?}", INFLUX_WRITE_TIMEOUT))?
+        .map_err(|e| anyhow::anyhow!(e))
+}
+
 async fn run_scraper(config: AppConfig) -> Result<()> {
     let client = Arc::new(Client::new(&config.influxdb.url, &config.influxdb.org, &config.influxdb.token));
+    let http = build_api_client()?;
     
     let mut interval = time::interval(Duration::from_secs(config.api.scraping_interval_secs));
+    // After a slow tick, don't fire a burst of catch-up scrapes; just resume the cadence.
+    interval.set_missed_tick_behavior(time::MissedTickBehavior::Delay);
     
     let mut cached_data: HashMap<i32, AreaData> = HashMap::new();
     
@@ -124,17 +155,16 @@ async fn run_scraper(config: AppConfig) -> Result<()> {
                     info!("Cached - Area {}: {} free spaces", area.area_code, area.area_free_space_num);
                 }
                 
-                match client.write(&config.influxdb.bucket, stream::iter(data_points))
-                    .await {
+                match write_points(&client, &config.influxdb.bucket, data_points).await {
                         Ok(_) => info!("Successfully wrote cached data to InfluxDB"),
-                        Err(e) => error!("Failed to write cached data to InfluxDB: {}", e),
+                        Err(e) => error!("Failed to write cached data to InfluxDB: {:#}", e),
                     }
                 
                 continue;
         }
     }
         
-        match fetch_parking_data(&config.api.url).await {
+        match fetch_parking_data(&http, &config.api.url).await {
             Ok(data) => {
                 if !data.success {
                     error!("API returned unsuccessful response");
@@ -163,14 +193,13 @@ async fn run_scraper(config: AppConfig) -> Result<()> {
                     info!("Area {}: {} free spaces", area.area_code, area.area_free_space_num);
                 }
                 
-                match client.write(&config.influxdb.bucket, stream::iter(data_points))
-                    .await {
+                match write_points(&client, &config.influxdb.bucket, data_points).await {
                         Ok(_) => info!("Successfully wrote data to InfluxDB"),
-                        Err(e) => error!("Failed to write to InfluxDB: {}", e),
+                        Err(e) => error!("Failed to write to InfluxDB: {:#}", e),
                     }
             }
             Err(e) => {
-                error!("Error fetching parking data: {}", e);
+                error!("Error fetching parking data: {:#}", e);
             }
         }
     }
