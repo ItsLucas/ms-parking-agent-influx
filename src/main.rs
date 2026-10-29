@@ -97,20 +97,41 @@ fn is_in_maintenance_window() -> bool {
     (hour == 23 && minute >= 50) || (hour == 0 && minute < 20)
 }
 
+/// Mirrors the official page's mapping (https://ms.suzhouparking.kingfaster.com.cn/ getData()).
+/// B3/B5 lots have been re-numbered upstream (4 -> 18, 6 -> 19); both codes map to the same
+/// location while the area_code tag keeps the raw source identity.
+fn location_for(area_code: i32) -> &'static str {
+    match area_code {
+        12 => "SIP-B25-B26", // B25 & B26地库, 508 spaces
+        2 => "ZHONGMENG",    // 中盟地库, 205 spaces
+        4 | 18 => "SIP-B3",  // B3地库, 20 spaces
+        6 | 19 => "SIP-B5",  // B5地库, 20 spaces
+        _ => "Unknown",
+    }
+}
+
 fn create_data_point(area: &AreaData) -> DataPoint {
     let now = Utc::now();
     
     DataPoint::builder("parking_spaces")
         .tag("area_code", area.area_code.to_string())
-        .tag("location", match area.area_code {
-            12 => "SIP-B25-B26".to_string(),
-            2 => "ZHONGMENG".to_string(),
-            _ => "Unknown".to_string(),
-        })
+        .tag("location", location_for(area.area_code))
         .field("free_spaces", area.area_free_space_num)
         .timestamp(now.timestamp_nanos_opt().unwrap())
         .build()
         .unwrap()
+}
+
+/// Keep the last non-zero reading per area, but only for areas the API still reports:
+/// retired codes (e.g. 4/6 after the B3/B5 renumbering) must not be replayed forever
+/// during the maintenance window.
+fn update_cache(cache: &mut HashMap<i32, AreaData>, areas: &[AreaData]) {
+    cache.retain(|code, _| areas.iter().any(|a| a.area_code == *code));
+    for area in areas {
+        if area.area_free_space_num > 0 {
+            cache.insert(area.area_code, area.clone());
+        }
+    }
 }
 
 async fn write_points(client: &Client, bucket: &str, data_points: Vec<DataPoint>) -> Result<()> {
@@ -176,11 +197,7 @@ async fn run_scraper(config: AppConfig) -> Result<()> {
                     continue;
                 }
                 
-                for area in &data.msparking_data {
-                    if area.area_free_space_num > 0 {
-                        cached_data.insert(area.area_code, area.clone());
-                    }
-                }
+                update_cache(&mut cached_data, &data.msparking_data);
                 
                 let data_points: Vec<DataPoint> = data.msparking_data
                     .iter()
@@ -215,4 +232,43 @@ async fn main() -> Result<()> {
     run_scraper(config).await?;
     
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn maps_known_areas() {
+        assert_eq!(location_for(12), "SIP-B25-B26");
+        assert_eq!(location_for(2), "ZHONGMENG");
+        assert_eq!(location_for(4), "SIP-B3");
+        assert_eq!(location_for(18), "SIP-B3");
+        assert_eq!(location_for(6), "SIP-B5");
+        assert_eq!(location_for(19), "SIP-B5");
+        assert_eq!(location_for(99), "Unknown");
+    }
+
+    #[test]
+    fn parses_live_payload_with_type_field() {
+        let raw = r#"{"success":true,"msparkingData":[{"type":1,"areaCode":12,"areaFreeSpaceNum":54},{"type":3,"areaCode":2,"areaFreeSpaceNum":117},{"type":5,"areaCode":18,"areaFreeSpaceNum":17},{"type":5,"areaCode":19,"areaFreeSpaceNum":17}],"date":"2026.10.29    星期四"}"#;
+        let r: ApiResponse = serde_json::from_str(raw).unwrap();
+        let locs: Vec<_> = r.msparking_data.iter().map(|a| location_for(a.area_code)).collect();
+        assert_eq!(locs, ["SIP-B25-B26", "ZHONGMENG", "SIP-B3", "SIP-B5"]);
+    }
+
+    fn area(code: i32, n: i64) -> AreaData {
+        AreaData { area_code: code, area_free_space_num: n }
+    }
+
+    #[test]
+    fn cache_drops_retired_codes_and_keeps_last_nonzero() {
+        let mut cache = HashMap::new();
+        update_cache(&mut cache, &[area(12, 30), area(4, 8), area(6, 10)]);
+        update_cache(&mut cache, &[area(12, 0), area(18, 17), area(19, 17)]);
+        let mut keys: Vec<_> = cache.keys().copied().collect();
+        keys.sort();
+        assert_eq!(keys, [12, 18, 19]);
+        assert_eq!(cache[&12].area_free_space_num, 30); // zero doesn't overwrite last non-zero
+    }
 }
