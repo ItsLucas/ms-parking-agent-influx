@@ -1,11 +1,18 @@
+mod predictor;
+
 use anyhow::{Context, Result};
-use chrono::{DateTime, Timelike, Utc};
+use chrono::{DateTime, Datelike, NaiveDate, Timelike, Utc};
 use chrono_tz::Asia::Shanghai;
 use config::{Config, File};
 use futures::stream;
 use influxdb2::Client;
 use influxdb2::models::DataPoint;
-use log::{error, info};
+use log::{error, info, warn};
+use predictor::{
+    BACKTEST_EVAL_DAYS, HISTORY_LOOKBACK_DAYS, LiveTracker, PredictorModel, TARGET_LOCATION,
+    backtest_to_datapoints, fetch_history_curves, format_min_of_day, is_weekday,
+    prediction_to_datapoint, run_causal_backtest, train_model,
+};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -143,6 +150,77 @@ async fn write_points(client: &Client, bucket: &str, data_points: Vec<DataPoint>
         .map_err(|e| anyhow::anyhow!(e))
 }
 
+async fn refresh_model_and_backtest(
+    http: &reqwest::Client,
+    client: &Client,
+    config: &AppConfig,
+    ref_date: NaiveDate,
+    run_backtest: bool,
+    write_backtest: bool,
+) -> Result<Option<PredictorModel>> {
+    let days = fetch_history_curves(
+        http,
+        &config.influxdb.url,
+        &config.influxdb.org,
+        &config.influxdb.bucket,
+        &config.influxdb.token,
+        HISTORY_LOOKBACK_DAYS,
+    )
+    .await?;
+
+    let model = train_model(&days, ref_date);
+    if let Some(ref m) = model {
+        info!(
+            "Trained predictor model for {} using {} workdays (Mon-Wed:{}, Thu:{}, Fri:{})",
+            m.built_date,
+            m.total_workdays,
+            m.groups[0].sample_days,
+            m.groups[1].sample_days,
+            m.groups[2].sample_days
+        );
+    } else {
+        warn!(
+            "Not enough historical workdays ({}) to train predictor model",
+            days.len()
+        );
+    }
+
+    if run_backtest {
+        let reports = run_causal_backtest(&days, BACKTEST_EVAL_DAYS);
+        if reports.is_empty() {
+            warn!(
+                "Skipping backtest: need more than {} historical workdays (have {})",
+                predictor::BACKTEST_MIN_TRAIN_DAYS,
+                days.len()
+            );
+        } else {
+            for r in &reports {
+                info!(
+                    "Backtest [{}] (last {}d, {} filled): MAE={:.1}m MedAE={:.1}m Bias={:+.1}m P90={:.1}m FillAcc={:.0}%",
+                    r.checkpoint_label,
+                    r.sample_days,
+                    r.filled_days,
+                    r.mae_mins,
+                    r.medae_mins,
+                    r.bias_mins,
+                    r.p90_abs_err_mins,
+                    r.fill_acc * 100.0
+                );
+            }
+            if write_backtest {
+                let pts = backtest_to_datapoints(Utc::now(), &reports)?;
+                write_points(client, &config.influxdb.bucket, pts).await?;
+                info!(
+                    "Wrote {} backtest metrics to InfluxDB (parking_prediction_backtest)",
+                    reports.len()
+                );
+            }
+        }
+    }
+
+    Ok(model)
+}
+
 async fn run_scraper(config: AppConfig) -> Result<()> {
     let client = Arc::new(Client::new(&config.influxdb.url, &config.influxdb.org, &config.influxdb.token));
     let http = build_api_client()?;
@@ -152,12 +230,61 @@ async fn run_scraper(config: AppConfig) -> Result<()> {
     interval.set_missed_tick_behavior(time::MissedTickBehavior::Delay);
     
     let mut cached_data: HashMap<i32, AreaData> = HashMap::new();
+    let mut tracker = LiveTracker::default();
+    let mut model: Option<PredictorModel> = None;
+    let mut last_model_refresh: Option<NaiveDate> = None;
+    let mut last_backtest_date: Option<NaiveDate> = None;
     
     info!("Starting parking data scraper. Interval: {} seconds", config.api.scraping_interval_secs);
+
+    // Best-effort startup model load + backtest; never block or abort scraping on failure.
+    let startup_sh = Utc::now().with_timezone(&Shanghai);
+    let startup_date = startup_sh.date_naive();
+    match refresh_model_and_backtest(&http, &client, &config, startup_date, true, true).await {
+        Ok(m) => {
+            model = m;
+            last_model_refresh = Some(startup_date);
+            if startup_sh.hour() >= 13 {
+                last_backtest_date = Some(startup_date);
+            }
+        }
+        Err(e) => error!("Initial predictor refresh failed (scraper will continue): {:#}", e),
+    }
     
     loop {
         interval.tick().await;
         info!("Fetching parking data...");
+
+        let now_sh = Utc::now().with_timezone(&Shanghai);
+        let today = now_sh.date_naive();
+        let now_min = (now_sh.hour() * 60 + now_sh.minute()) as usize;
+
+        // Refresh model once each morning at/after 06:30 Asia/Shanghai
+        if last_model_refresh != Some(today) && now_min >= 6 * 60 + 30 {
+            match refresh_model_and_backtest(&http, &client, &config, today, false, false).await {
+                Ok(m) => {
+                    if m.is_some() {
+                        model = m;
+                    }
+                    last_model_refresh = Some(today);
+                }
+                Err(e) => error!("Morning predictor refresh failed: {:#}", e),
+            }
+        }
+
+        // Run daily causal backtest at/after 13:00 on weekdays (after morning peak settles)
+        if is_weekday(now_sh.weekday()) && last_backtest_date != Some(today) && now_min >= 13 * 60 {
+            let tomorrow = today.succ_opt().unwrap_or(today);
+            match refresh_model_and_backtest(&http, &client, &config, tomorrow, true, true).await {
+                Ok(m) => {
+                    if m.is_some() {
+                        model = m;
+                    }
+                    last_backtest_date = Some(today);
+                }
+                Err(e) => error!("Daily 13:00 backtest failed: {:#}", e),
+            }
+        }
         
         let using_cache = is_in_maintenance_window();
         if using_cache {
@@ -199,7 +326,7 @@ async fn run_scraper(config: AppConfig) -> Result<()> {
                 
                 update_cache(&mut cached_data, &data.msparking_data);
                 
-                let data_points: Vec<DataPoint> = data.msparking_data
+                let mut data_points: Vec<DataPoint> = data.msparking_data
                     .iter()
                     .map(create_data_point)
                     .collect();
@@ -208,6 +335,41 @@ async fn run_scraper(config: AppConfig) -> Result<()> {
                 
                 for area in &data.msparking_data {
                     info!("Area {}: {} free spaces", area.area_code, area.area_free_space_num);
+                }
+
+                // Dynamic full-time prediction for SIP-B25-B26 during weekday mornings (07:30-12:30)
+                if is_weekday(now_sh.weekday())
+                    && (7 * 60 + 30..=12 * 60 + 30).contains(&now_min)
+                    && let Some(b25) = data
+                        .msparking_data
+                        .iter()
+                        .find(|a| location_for(a.area_code) == TARGET_LOCATION)
+                {
+                    let smoothed_free = tracker.record(now_sh, b25.area_free_space_num);
+                    if let Some(ref m) = model
+                        && let Some(pred) = m.predict_at(
+                            now_sh.weekday(),
+                            now_min,
+                            smoothed_free,
+                            tracker.locked_full_min,
+                        )
+                    {
+                        let eta = pred
+                            .predicted_full_min
+                            .map(format_min_of_day)
+                            .unwrap_or_else(|| "N/A".to_string());
+                        info!(
+                            "Prediction {}: free={:.0} ETA={} fill_prob={:.0}%",
+                            TARGET_LOCATION,
+                            pred.smoothed_free,
+                            eta,
+                            pred.will_fill_prob * 100.0
+                        );
+                        match prediction_to_datapoint(now_sh, &pred) {
+                            Ok(dp) => data_points.push(dp),
+                            Err(e) => error!("Failed to encode prediction point: {:#}", e),
+                        }
+                    }
                 }
                 
                 match write_points(&client, &config.influxdb.bucket, data_points).await {
@@ -226,8 +388,47 @@ async fn run_scraper(config: AppConfig) -> Result<()> {
 async fn main() -> Result<()> {
     env_logger::init();
     
+    let args: Vec<String> = std::env::args().collect();
     let config = load_config().await?;
     info!("Configuration loaded successfully");
+
+    if args.iter().any(|a| a == "--backtest" || a == "--backtest-write") {
+        let write_bt = args.iter().any(|a| a == "--backtest-write");
+        let client = Client::new(&config.influxdb.url, &config.influxdb.org, &config.influxdb.token);
+        let http = build_api_client()?;
+        let today = Utc::now().with_timezone(&Shanghai).date_naive();
+        let days = fetch_history_curves(
+            &http,
+            &config.influxdb.url,
+            &config.influxdb.org,
+            &config.influxdb.bucket,
+            &config.influxdb.token,
+            HISTORY_LOOKBACK_DAYS,
+        )
+        .await?;
+        println!("Loaded {} non-holiday workdays (last {}d)", days.len(), HISTORY_LOOKBACK_DAYS);
+        let reports = run_causal_backtest(&days, BACKTEST_EVAL_DAYS);
+        for r in &reports {
+            println!(
+                "  {} | days={:2} filled={:2} | MAE={:4.1}m MedAE={:4.1}m Bias={:+5.1}m P90={:4.1}m | FillAcc={:5.1}%",
+                r.checkpoint_label,
+                r.sample_days,
+                r.filled_days,
+                r.mae_mins,
+                r.medae_mins,
+                r.bias_mins,
+                r.p90_abs_err_mins,
+                r.fill_acc * 100.0
+            );
+        }
+        if write_bt && !reports.is_empty() {
+            let pts = backtest_to_datapoints(Utc::now(), &reports)?;
+            write_points(&client, &config.influxdb.bucket, pts).await?;
+            println!("Wrote {} backtest metrics to InfluxDB.", reports.len());
+        }
+        let _ = today;
+        return Ok(());
+    }
     
     run_scraper(config).await?;
     
